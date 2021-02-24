@@ -5,6 +5,7 @@ import sys
 import rospy
 import argparse
 import message_filters
+import numpy as np
 from cv_bridge import CvBridge, CvBridgeError
 from ros_openpose.msg import Frame
 from sensor_msgs.msg import Image, CameraInfo
@@ -23,7 +24,7 @@ except ImportError as e:
 
 
 class rosOpenPose:
-    def __init__(self, frame_id, no_depth, pub_topic, color_topic, depth_topic, cam_info_topic, op_wrapper):
+    def __init__(self, frame_id, pub_topic, color_topic, depth_topic, cam_info_topic, op_wrapper):
         rospy.sleep(6.0)  # so light levels in image have time to stabilize
         image_sub = message_filters.Subscriber(color_topic, Image)
         depth_sub = message_filters.Subscriber(depth_topic, Image)
@@ -33,7 +34,6 @@ class rosOpenPose:
         self.pub = rospy.Publisher(pub_topic, Frame, queue_size=10)
 
         self.frame_id = frame_id
-        self.no_depth = no_depth
 
         self.bridge = CvBridge()
 
@@ -45,6 +45,8 @@ class rosOpenPose:
         self.fy = False
         self.cx = False
         self.cy = False
+
+        self.depth = None
 
         """ OpenPose skeleton dictionary
         {0, "Nose"}, {13, "LKnee"}
@@ -69,12 +71,17 @@ class rosOpenPose:
         self.cy = cam_info.K[5]
         self.info_sub.unregister()
 
-    def convert_to_3d(self, u, v, depth):
-        if self.no_depth: return 0, 0, 0
-        z = depth[v, u] / 1000
-        x = (z / self.fx) * (u - self.cx)
-        y = (z / self.fy) * (v - self.cy)
-        return x, y, z
+    def process_depth(self, U, V, XYZ):
+        num_persons, body_part_count = U.shape
+        for i in range(num_persons):
+            for j in range(body_part_count):
+                XYZ[i, j, 2] = self.depth[V[i, j], U[i, j]]
+        XYZ[:, :, 2] /= 1000  # convert to meters
+
+    def compute_3d_vectorized(self, U, V, XYZ):
+        Z = XYZ[:, :, 2]
+        XYZ[:, :, 0] = (Z / self.fx) * (U - self.cx)
+        XYZ[:, :, 1] = (Z / self.fy) * (V - self.cy)
 
     def callback(self, ros_image, ros_depth):
         # Don't process if we have not obtained K matrix yet
@@ -87,10 +94,10 @@ class rosOpenPose:
         fr.header.stamp = rospy.Time.now()
 
         # Convert images to cv2 matrices
-        image = depth = None
+        image = None
         try:
             image = self.bridge.imgmsg_to_cv2(ros_image, "bgr8")
-            depth = self.bridge.imgmsg_to_cv2(ros_depth, "32FC1")
+            self.depth = self.bridge.imgmsg_to_cv2(ros_depth, "32FC1")
         except CvBridgeError as e:
             rospy.logerr("CvBridge Error: {0}".format(e))
 
@@ -111,28 +118,62 @@ class rosOpenPose:
         # Check to see if hands were detected
         lhand_detected = False
         rhand_detected = False
-        if lhand_kp.shape != (): lhand_detected = True
-        if rhand_kp.shape != (): rhand_detected = True
-        hand_part_count = lhand_kp.shape[1]
+        hand_part_count = 0
+        if lhand_kp.shape != ():
+            lhand_detected = True
+            hand_part_count = lhand_kp.shape[1]
+        if rhand_kp.shape != ():
+            rhand_detected = True
+            hand_part_count = rhand_kp.shape[1]
 
-        # Handle body points
+        # Construct Frame message
         fr.persons.resize(num_persons)
         try:
+            # Create views (no copies made, so this remains efficient)
+            U = pose_kp[:, :, 0]
+            V = pose_kp[:, :, 1]
+
+            b_XYZ = np.zeros((num_persons, body_part_count, 3), dtype=np.float32)
+
+            # Populate Z vector in XYZ matrix with proper depth values
+            self.process_depth(U, V, b_XYZ)
+
+            # Perform vectorized 3D computation for body keypoints
+            # Populate X and Y vectors in XYZ matrix
+            self.compute_3d_vectorized(U, V, b_XYZ)
+
+            # Perform the vectorized operation for left hand
+            if lhand_detected:
+                U = lhand_kp[:, :, 0]
+                V = lhand_kp[:, :, 1]
+                lh_XYZ = np.zeros((num_persons, hand_part_count, 3), dtype=np.float32)
+                self.process_depth(U, V, lh_XYZ)
+                self.compute_3d_vectorized(U, V, lh_XYZ)
+
+            # Do same for right hand
+            if rhand_detected:
+                U = rhand_kp[:, :, 0]
+                V = rhand_kp[:, :, 1]
+                rh_XYZ = np.zeros((num_persons, hand_part_count, 3), dtype=np.float32)
+                self.process_depth(U, V, rh_XYZ)
+                self.compute_3d_vectorized(U, V, rh_XYZ)
+
             for person in range(num_persons):
                 fr.persons[person].bodyParts.resize(body_part_count)
                 fr.persons[person].leftHandParts.resize(hand_part_count)
                 fr.persons[person].rightHandParts.resize(hand_part_count)
 
+                # Construct detected_hands iterable for later for loop
                 detected_hands = []
                 if lhand_detected:
-                    detected_hands.append((lhand_kp, fr.persons[person].leftHandParts))
+                    detected_hands.append((lhand_kp, fr.persons[person].leftHandParts, lh_XYZ))
                 if rhand_detected:
-                    detected_hands.append((rhand_kp, fr.persons[person].rightHandParts))
+                    detected_hands.append((rhand_kp, fr.persons[person].rightHandParts, rh_XYZ))
 
-                # Process the body
+                # Process body key points
                 for bp in range(body_part_count):
                     u, v, s = pose_kp[person, bp]
-                    x, y, z = self.convert_to_3d(u, v, depth)
+                    x, y, z = b_XYZ[person, bp]
                     arr = fr.persons[person].bodyParts[bp]
                     arr.pixel.x = u
                     arr.pixel.y = v
@@ -143,9 +184,9 @@ class rosOpenPose:
 
                 # Process left and right hands
                 for hp in range(hand_part_count):
-                    for kp, harr in detected_hands:
+                    for kp, harr, h_XYZ in detected_hands:
                         u, v, s = kp[person, hp]
-                        x, y, z = self.convert_to_3d(u, v, depth)
+                        x, y, z = h_XYZ[person, hp]
                         arr = harr[hp]
                         arr.pixel.x = u
                         arr.pixel.y = v
@@ -163,7 +204,6 @@ class rosOpenPose:
 def main():
     rospy.init_node('ros_openpose')
     frame_id = rospy.get_param("~frame_id")
-    no_depth = rospy.get_param("~no_depth")
     pub_topic = rospy.get_param("~pub_topic")
     color_topic = rospy.get_param("~color_topic")
     depth_topic = rospy.get_param("~depth_topic")
@@ -199,7 +239,7 @@ def main():
         op_wrapper.start()
 
         # Start ros wrapper
-        rop = rosOpenPose(frame_id, no_depth, pub_topic, color_topic, depth_topic, cam_info_topic, op_wrapper)
+        rop = rosOpenPose(frame_id, pub_topic, color_topic, depth_topic, cam_info_topic, op_wrapper)
         rospy.spin()
 
     except Exception as e:
